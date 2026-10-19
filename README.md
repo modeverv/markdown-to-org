@@ -7,6 +7,7 @@ Convert Markdown text to Org-mode format automatically when yanking in Emacs. Pe
 - Automatic conversion of Markdown to Org format when yanking
 - Support for headers, lists, checkboxes, code blocks, and inline formatting
 - Preserves nested structures and indentation
+- Preserves LaTeX math enclosed in `\[...\]` or `\(...\)` verbatim
 - Works with both clipboard and kill-ring
 
 ## Installation
@@ -78,6 +79,12 @@ Output (Org):
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+Run the regression tests from the repository root:
+
+```sh
+emacs -Q --batch -L . -l test/markdown-to-org-test.el -f ert-run-tests-batch-and-exit
+```
 
 ## License
 

@@ -68,9 +68,71 @@
         (string-match-p "`[^`]+`" text))))
 
 
+(defun markdown-to-org--escaped-p (position)
+  "Return non-nil if the character at POSITION follows an odd backslash count."
+  (save-excursion
+    (goto-char position)
+    (let ((count 0))
+      (while (eq (char-before) ?\\)
+        (setq count (1+ count))
+        (backward-char))
+      (= (% count 2) 1))))
+
+(defun markdown-to-org--protect-latex ()
+  "Replace complete LaTeX fragments in the current buffer with placeholders.
+Recognize unescaped \\[...\\] and \\(...\\) delimiter pairs.
+Return an alist mapping placeholders to the original fragments.
+Keep newlines in placeholders so Markdown conversions retain line boundaries.
+Unmatched delimiters are treated as ordinary Markdown text."
+  (let ((prefix "MDTORGMATH")
+        (index 0)
+        fragments)
+    ;; Choose a prefix absent from the input, including ordinary prose or code.
+    (while (save-excursion
+             (goto-char (point-min))
+             (search-forward prefix nil t))
+      (setq prefix (concat prefix "X")))
+    (goto-char (point-min))
+    (while (re-search-forward (regexp-opt '("\\[" "\\(")) nil t)
+      (let* ((begin (match-beginning 0))
+             (closer (if (equal (match-string 0) "\\[") "\\]" "\\)"))
+             (end (unless (markdown-to-org--escaped-p begin)
+                    (save-excursion
+                      (catch 'end
+                        (while (search-forward closer nil t)
+                          (unless (markdown-to-org--escaped-p (- (point) 2))
+                            (throw 'end (point))))
+                        nil)))))
+        (when end
+          (let* ((original (buffer-substring-no-properties begin end))
+                 (placeholder (replace-regexp-in-string
+                               "[^\n]+" (format "%s%dEND" prefix index)
+                               original t t)))
+            (delete-region begin end)
+            (goto-char begin)
+            (insert placeholder)
+            (push (cons placeholder original) fragments)
+            (setq index (1+ index))))))
+    fragments))
+
 (defun markdown-to-org--convert (text)
+  "Convert Markdown TEXT to Org while preserving delimited LaTeX verbatim."
+  (with-temp-buffer
+    (insert text)
+    (let* ((fragments (markdown-to-org--protect-latex))
+           (converted (markdown-to-org--convert-markdown (buffer-string))))
+      (erase-buffer)
+      (insert converted)
+      (dolist (fragment fragments)
+        (goto-char (point-min))
+        (search-forward (car fragment))
+        ;; Restore literally: LaTeX backslashes are not replacement escapes.
+        (replace-match (cdr fragment) t t))
+      (buffer-string))))
+
+(defun markdown-to-org--convert-markdown (text)
   "Convert markdown TEXT to org format.
-The conversion is done in a specific order to handle nested structures correctly:
+Convert in the following order to handle nested structures correctly:
 1. Block-level conversions (headers, code blocks)
 2. List structure conversions (checkboxes, nested lists)
 3. Inline formatting (bold, italic, code, links)"

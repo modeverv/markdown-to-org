@@ -28,6 +28,7 @@
 ;;; Code:
 
 (require 'org)
+(require 'cl-lib)
 
 (defgroup markdown-to-org nil
   "Convert markdown to org-mode when yanking."
@@ -115,64 +116,91 @@ Unmatched delimiters are treated as ordinary Markdown text."
             (setq index (1+ index))))))
     fragments))
 
+(defun markdown-to-org--protect-literals ()
+  "Protect code, link destinations and escaped emphasis in the current buffer.
+Return an alist of placeholders and literal Org replacements.
+Preserve newlines so hiding a block cannot join separate lines of emphasis."
+  (let ((prefix "MDTORGLITERAL")
+        (index 0)
+        fragments)
+    (while (save-excursion
+             (goto-char (point-min))
+             (search-forward prefix nil t))
+      (setq prefix (concat prefix "X")))
+    (cl-labels
+        ((protect (begin end replacement)
+           (let ((placeholder
+                  (replace-regexp-in-string
+                   "[^\n]+" (format "%s%dEND" prefix index)
+                   (buffer-substring-no-properties begin end) t t)))
+             (delete-region begin end)
+             (goto-char begin)
+             (insert placeholder)
+             (push (cons placeholder replacement) fragments)
+             (setq index (1+ index)))))
+      ;; Convert the fences now, but keep their contents out of every pass.
+      (goto-char (point-min))
+      (while (re-search-forward "^```\\([[:alnum:]]+\\)?$" nil t)
+        (let* ((begin (match-beginning 0))
+               (body-begin (match-end 0))
+               (lang (match-string-no-properties 1))
+               (header (if lang (concat "#+BEGIN_SRC " lang) "#+BEGIN_SRC"))
+               (closed (re-search-forward "^```$" nil t))
+               (body-end (if closed (match-beginning 0) (point-max)))
+               (end (if closed (match-end 0) (point-max)))
+               (body (buffer-substring-no-properties body-begin body-end)))
+          (protect begin end
+                   (concat header body
+                           (unless (or closed (string-suffix-p "\n" body))
+                             "\n")
+                           "#+END_SRC" (unless closed "\n")))))
+      ;; Store the Org code delimiters together with the literal content.
+      (goto-char (point-min))
+      (while (re-search-forward "`\\([^`\n]+\\)`" nil t)
+        (unless (markdown-to-org--escaped-p (match-beginning 0))
+          (protect (match-beginning 0) (match-end 0)
+                   (concat "=" (match-string-no-properties 1) "="))))
+      ;; Only hide the destination: link labels still support emphasis.
+      (goto-char (point-min))
+      (while (re-search-forward "\\[\\([^]]+\\)\\](\\([^)]+\\))" nil t)
+        (protect (match-beginning 2) (match-end 2)
+                 (match-string-no-properties 2)))
+      (goto-char (point-min))
+      (while (re-search-forward "[*_]" nil t)
+        (when (markdown-to-org--escaped-p (match-beginning 0))
+          (protect (match-beginning 0) (match-end 0)
+                   (match-string-no-properties 0)))))
+    fragments))
+
 (defun markdown-to-org--convert (text)
-  "Convert Markdown TEXT to Org while preserving delimited LaTeX verbatim."
+  "Convert Markdown TEXT to Org while preserving LaTeX and literal content."
   (with-temp-buffer
     (insert text)
-    (let* ((fragments (markdown-to-org--protect-latex))
+    (let* ((math (markdown-to-org--protect-latex))
+           (literals (markdown-to-org--protect-literals))
            (converted (markdown-to-org--convert-markdown (buffer-string))))
       (erase-buffer)
       (insert converted)
-      (dolist (fragment fragments)
+      ;; Literal replacements may themselves contain protected math tokens.
+      (dolist (fragment (append literals math))
         (goto-char (point-min))
         (search-forward (car fragment))
-        ;; Restore literally: LaTeX backslashes are not replacement escapes.
+        ;; Backslashes in code, URLs and LaTeX are not replacement escapes.
         (replace-match (cdr fragment) t t))
       (buffer-string))))
 
 (defun markdown-to-org--convert-markdown (text)
   "Convert markdown TEXT to org format.
 Convert in the following order to handle nested structures correctly:
-1. Block-level conversions (headers, code blocks)
-2. List structure conversions (checkboxes, nested lists)
-3. Inline formatting (bold, italic, code, links)"
+Code and other literals must already be protected by the caller.
+Convert lists, inline formatting, then headings so generated Org heading
+stars cannot be mistaken for Markdown emphasis."
   (with-temp-buffer
-    (insert "\n")
     (insert text)
     ;; debug
     ;; (message "Initial buffer:\n%s" (buffer-string))
 
-    ;; Step 1: Block-level conversions
-    ;; -------------------------------
-
-    ;; Convert headers (# -> *) with proper spacing
-    (goto-char (point-min))
-    (while (re-search-forward "^\\(#+\\)\\([ \t]*\\)\\(.+\\)$" nil t)
-      (let* ((hashes (match-string 1))
-             (spaces (match-string 2))
-             (content (match-string 3))
-             (level (length hashes))
-             (stars (make-string level ?*)))
-        (replace-match (concat stars spaces content))))
-
-    ;; Convert code blocks with language support
-    (goto-char (point-min))
-    (while (re-search-forward "^```\\([[:alnum:]]+\\)?$" nil t)
-      (let ((lang (match-string 1)))
-        (replace-match (if lang
-                           (format "#+BEGIN_SRC %s" lang)
-                         "#+BEGIN_SRC"))
-        ;; Find and convert the ending marker
-        (if (re-search-forward "^```$" nil t)
-            (replace-match "#+END_SRC")
-          ;; If no ending marker, add one at EOF
-          (goto-char (point-max))
-          (unless (looking-back "\n" nil)
-            (insert "\n"))
-          (insert "#+END_SRC\n"))))
-
-    ;; Step 2: List structure conversions
-    ;; ---------------------------------
+    ;; List structure conversions
 
     ;; First, handle checkbox lists with proper indentation
     (goto-char (point-min))
@@ -202,20 +230,19 @@ Convert in the following order to handle nested structures correctly:
              (org-indent (make-string (* indent-level 2) ?\s)))
         (replace-match (concat org-indent "- "))))
 
-    ;; Step 3: Inline formatting
-    ;; ------------------------
-
-    ;; Convert inline code (backticks to =)
+    ;; Convert single-star emphasis before generating Org bold stars.
+    ;; Inspect the surrounding characters without consuming them: they may
+    ;; also be the boundary of the next match, or the end of the buffer.
     (goto-char (point-min))
-    (while (re-search-forward "`\\([^`\n]+\\)`" nil t)
-      (replace-match "=\\1="))
-
-    ;; Convert bold (**) and italic (_)
-    (goto-char (point-min))
-    (while (re-search-forward ;; doesn't work at the start -> insert \n
-            (rx (group (not "*")) "*" (group (not (any space "*")) (* (not (any "*" ?\n)))) "*" (group (not "*")))
+    (while (re-search-forward
+            (rx "*" (group (not (any space "*"))
+                           (? (seq (* (not (any "*" ?\n)))
+                                   (not (any space "*")))))
+                "*")
             nil t)
-      (replace-match "\\1/\\2/\\3"))
+      (unless (or (eq (char-before (match-beginning 0)) ?*)
+                  (eq (char-after (match-end 0)) ?*))
+        (replace-match "/\\1/" t)))
 
     (goto-char (point-min))
     (while (re-search-forward
@@ -231,10 +258,14 @@ Convert in the following order to handle nested structures correctly:
     (while (re-search-forward "\\[\\([^]]+\\)\\](\\([^)]+\\))" nil t)
       (replace-match "[[\\2][\\1]]"))
 
+    ;; Convert headers last so their stars never enter the emphasis passes.
+    (goto-char (point-min))
+    (while (re-search-forward "^\\(#+\\)\\([ \t]*\\)\\(.+\\)$" nil t)
+      (replace-match (concat (make-string (length (match-string 1)) ?*)
+                             (match-string 2) (match-string 3)) t t))
+
     ;; debug
     ;; (message "Final conversion result:\n%s" (buffer-string))
-    (goto-char (point-min))
-    (delete-char 1)
     (buffer-string)))
 
 (defun markdown-to-org--smart-yank-advice (orig-fun &rest args)

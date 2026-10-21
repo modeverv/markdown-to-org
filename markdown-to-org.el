@@ -137,6 +137,7 @@ Convert in the following order to handle nested structures correctly:
 2. List structure conversions (checkboxes, nested lists)
 3. Inline formatting (bold, italic, code, links)"
   (with-temp-buffer
+    (insert "\n")
     (insert text)
     ;; debug
     ;; (message "Initial buffer:\n%s" (buffer-string))
@@ -211,7 +212,15 @@ Convert in the following order to handle nested structures correctly:
 
     ;; Convert bold (**) and italic (_)
     (goto-char (point-min))
-    (while (re-search-forward "\\*\\*\\([^*\n]+\\)\\*\\*" nil t)
+    (while (re-search-forward ;; doesn't work at the start -> insert \n
+            (rx (group (not "*")) "*" (group (not (any space "*")) (* (not (any "*" ?\n)))) "*" (group (not "*")))
+            nil t)
+      (replace-match "\\1/\\2/\\3"))
+
+    (goto-char (point-min))
+    (while (re-search-forward
+            (rx "**" (group (not (any space "*")) (* (not (any "*" ?\n)))) "**")
+            nil t)
       (replace-match "*\\1*"))
     (goto-char (point-min))
     (while (re-search-forward "_\\([^_\n]+\\)_" nil t)
@@ -224,6 +233,8 @@ Convert in the following order to handle nested structures correctly:
 
     ;; debug
     ;; (message "Final conversion result:\n%s" (buffer-string))
+    (goto-char (point-min))
+    (delete-char 1)
     (buffer-string)))
 
 (defun markdown-to-org--smart-yank-advice (orig-fun &rest args)
